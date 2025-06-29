@@ -40,14 +40,29 @@ CLASS_NAMES = {
 
 # 🔧 Load model
 MODEL_PATH = os.getenv("MODEL_PATH", "model/sports_classifier_efficientnetb3.h5")
-try:
-    model = tf.keras.models.load_model(MODEL_PATH)
-    logging.info("✅ Model loaded successfully.")
-except Exception as e:
-    logging.error(f"❌ Model load failed: {e}")
-    raise
 
-target_size = model.input_shape[1:3]
+# Global variable for model
+model = None
+
+def load_model():
+    global model
+    if model is None:
+        try:
+            model = tf.keras.models.load_model(MODEL_PATH)
+            logging.info("✅ Model loaded successfully.")
+        except Exception as e:
+            logging.error(f"❌ Model load failed: {e}")
+            raise
+    return model
+
+# Initialize model at startup
+try:
+    model = load_model()
+    target_size = model.input_shape[1:3]
+    logging.info(f"✅ Model initialized with input size {target_size}")
+except Exception as e:
+    logging.error(f"❌ Initial model load failed: {e}")
+    # Don't raise here to allow app to start, will try again on first request
 
 # 🖼 Preprocessing to match training pipeline
 def preprocess_image(file_path):
@@ -66,7 +81,7 @@ def get_drive_service():
         raise ValueError("GOOGLE_CREDENTIALS not set")
 
     # Ensure tmp directory exists locally; use /tmp for Vercel
-    temp_dir = os.path.join(os.getcwd(), "tmp") if not os.getenv("VERCEL") else "/tmp"
+    temp_dir = "/tmp" if os.getenv("VERCEL") else os.path.join(os.getcwd(), "tmp")
     os.makedirs(temp_dir, exist_ok=True)
     temp_cred_path = os.path.join(temp_dir, "service_account.json")
 
@@ -74,7 +89,11 @@ def get_drive_service():
         with open(temp_cred_path, "w") as f:
             f.write(credentials_json)
         creds = service_account.Credentials.from_service_account_file(temp_cred_path, scopes=SCOPES)
-        return build('drive', 'v3', credentials=creds)
+        service = build('drive', 'v3', credentials=creds)
+        # Clean up the credentials file after use
+        if os.path.exists(temp_cred_path):
+            os.remove(temp_cred_path)
+        return service
     except Exception as e:
         logging.error(f"Failed to initialize Drive service: {e}")
         raise
@@ -95,6 +114,17 @@ def index():
 
 @app.route('/predict', methods=['POST'])
 def predict():
+    global model, target_size
+    
+    # Ensure model is loaded
+    if model is None:
+        try:
+            model = load_model()
+            target_size = model.input_shape[1:3]
+        except Exception as e:
+            logging.error(f"Failed to load model on demand: {e}")
+            return jsonify({'status': 'fail', 'error': 'Model initialization failed'}), 500
+    
     if 'image' not in request.files:
         return jsonify({'status': 'fail', 'error': 'No image uploaded'}), 400
 
@@ -108,14 +138,23 @@ def predict():
     file.seek(0)
 
     filename = secure_filename(file.filename)
-    temp_dir = os.path.join(os.getcwd(), "tmp") if not os.getenv("VERCEL") else "/tmp"
+    temp_dir = "/tmp" if os.getenv("VERCEL") else os.path.join(os.getcwd(), "tmp")
     os.makedirs(temp_dir, exist_ok=True)
     temp_path = os.path.join(temp_dir, f"temp_{datetime.now().strftime('%Y%m%d%H%M%S')}_{filename}")
 
     try:
         file.save(temp_path)
-        drive_file_id = upload_to_drive(temp_path)
+        logging.info(f"Saved temporary file to {temp_path}")
+        
+        # Upload to Google Drive
+        try:
+            drive_file_id = upload_to_drive(temp_path)
+            logging.info(f"Uploaded to Drive with ID: {drive_file_id}")
+        except Exception as drive_error:
+            logging.error(f"Drive upload error: {drive_error}")
+            drive_file_id = None  # Continue with prediction even if Drive upload fails
 
+        # Process image and make prediction
         img = preprocess_image(temp_path)
         preds = model.predict(img)
         pred_index = int(np.argmax(preds[0]))
@@ -125,20 +164,37 @@ def predict():
 
         logging.info(f"Prediction: {result_class} ({confidence:.2f})")
 
-        supabase.table('predictions').insert({ 
-            'class': result_class, 
-            'confidence': confidence, 
-            'drive_file_id': drive_file_id, 
-            'timestamp': datetime.now(timezone.utc).isoformat()
-        }).execute()
+        # Store prediction in Supabase
+        try:
+            if drive_file_id:  # Only store in Supabase if we have a Drive file ID
+                supabase.table('predictions').insert({ 
+                    'class': result_class, 
+                    'confidence': confidence, 
+                    'drive_file_id': drive_file_id, 
+                    'timestamp': datetime.now(timezone.utc).isoformat()
+                }).execute()
+                logging.info("Prediction stored in Supabase")
+        except Exception as db_error:
+            logging.error(f"Database error: {db_error}")  # Continue even if DB storage fails
 
-        return jsonify({ 'status': 'success', 'class': result_class, 'confidence': confidence })
+        return jsonify({ 
+            'status': 'success', 
+            'class': result_class, 
+            'confidence': confidence,
+            'drive_upload_status': 'success' if drive_file_id else 'failed'
+        })
     except Exception as e:
         logging.error(f"Prediction error: {e}")
-        return jsonify({'status': 'fail', 'error': 'Prediction failed'}), 500
+        return jsonify({'status': 'fail', 'error': str(e)}), 500
     finally:
+        # Clean up temporary file
         if os.path.exists(temp_path):
-            os.remove(temp_path)
+            try:
+                os.remove(temp_path)
+                logging.info(f"Removed temporary file: {temp_path}")
+            except Exception as cleanup_error:
+                logging.error(f"Failed to remove temporary file: {cleanup_error}")
+
 
 # Vercel serverless function entry point
 if __name__ == '__main__':
